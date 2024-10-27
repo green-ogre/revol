@@ -4,15 +4,16 @@ use macroquad::rand;
 #[derive(Debug, Default, PartialEq)]
 pub struct Brain {
     pub outputs: Vec<NeuronNode>,
+    pub edges: Vec<NeuralCon>,
 }
 
 #[derive(Debug)]
 pub struct BrainBuilder {
-    edges: Vec<NeuralCon>,
+    pub edges: Vec<NeuralCon>,
 }
 
 impl BrainBuilder {
-    pub fn new(genome: Genome) -> Option<Self> {
+    pub fn new(genome: &Genome) -> Option<Self> {
         let mut edges = Vec::with_capacity(genome.genes.len());
         for gene in genome.genes.iter() {
             match NeuralCon::from_gene(*gene) {
@@ -29,10 +30,8 @@ impl BrainBuilder {
     ///     - Sense    -> Internal
     ///     - Internal -> Action
     ///     - Internal -> Internal
-    ///
-    /// If a Sense neuron connects to an Internal neuron, then that Internal Neuron must connect to
-    /// an Action neuron or the brain is invalid.
     pub fn new_with_edges(edges: Vec<NeuralCon>) -> Option<Self> {
+        // repeated edges
         let mut edge_comb = Vec::with_capacity(edges.len());
         for edge in edges.iter() {
             let e1 = (edge.lhs, edge.rhs);
@@ -43,34 +42,10 @@ impl BrainBuilder {
             edge_comb.push(e1);
         }
 
-        let mut internal = Vec::with_capacity(edges.len());
         for edge in edges.iter() {
-            if let Neuron::Internal(neuron) = edge.rhs {
-                if !internal.contains(&neuron) {
-                    internal.push(neuron);
-                }
-            } else if let Neuron::Internal(neuron) = edge.lhs {
-                if !internal.contains(&neuron) {
-                    internal.push(neuron);
-                }
-            }
-        }
-
-        for int in internal.iter() {
-            let mut is_transmitting = false;
-            let mut is_receiving = false;
-
-            for edge in edges.iter() {
-                if edge.lhs == Neuron::Internal(*int) && edge.rhs != Neuron::Internal(*int) {
-                    is_transmitting = true;
-                }
-
-                if edge.rhs == Neuron::Internal(*int) && edge.lhs != Neuron::Internal(*int) {
-                    is_receiving = true;
-                }
-            }
-
-            if !is_transmitting || !is_receiving {
+            if let Neuron::Action(_) = edge.lhs {
+                return None;
+            } else if let Neuron::Sense(_) = edge.rhs {
                 return None;
             }
         }
@@ -80,6 +55,7 @@ impl BrainBuilder {
 
     pub fn build(self) -> Brain {
         Brain {
+            edges: self.edges.clone(),
             outputs: NeuronNode::build_outputs(self.edges),
         }
     }
@@ -166,11 +142,11 @@ impl NeuronNode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NeuralCon {
-    assoc: Association,
-    lhs: Neuron,
-    rhs: Neuron,
+    pub assoc: Association,
+    pub lhs: Neuron,
+    pub rhs: Neuron,
 }
 
 impl NeuralCon {
@@ -220,7 +196,7 @@ pub enum Association {
 impl Association {
     pub fn new(weight: f32) -> Self {
         assert!(!weight.is_nan(), "nan association weight");
-        assert!((-4.0..4.0).contains(&weight), "invalid association weight");
+        assert!((-4.0..4.1).contains(&weight), "invalid association weight");
 
         if weight.is_sign_negative() {
             Self::Negative(weight)
@@ -365,6 +341,164 @@ impl SenseNeuron {
     }
 }
 
+pub fn default_init_edges(num_edges: usize, max_internal_neurons: usize) -> Vec<NeuralCon> {
+    assert!(max_internal_neurons > 0);
+    assert!(num_edges > 0);
+
+    let is_unique_edge = |edge: &NeuralCon, edges: &[NeuralCon]| {
+        !edges.iter().any(|c| {
+            (c.lhs == edge.lhs && c.rhs == edge.rhs) || (c.lhs == edge.rhs && c.rhs == edge.lhs)
+        })
+    };
+
+    let unique_sense = |assoc: f32, rhs: Neuron, edges: &[NeuralCon]| {
+        let mut rhs_variant = rand::gen_range(0, std::mem::variant_count::<SenseNeuron>()) as u32;
+        let mut sense = SenseNeuron::new_from_u32(rhs_variant);
+        while !is_unique_edge(
+            &NeuralCon::new(Association::new(assoc), Neuron::Sense(sense), rhs).unwrap(),
+            edges,
+        ) {
+            rhs_variant = rand::gen_range(0, std::mem::variant_count::<SenseNeuron>()) as u32;
+            sense = SenseNeuron::new_from_u32(rhs_variant);
+        }
+        Neuron::Sense(sense)
+    };
+
+    let unique_internal = |assoc: f32, lhs: Neuron, edges: &[NeuralCon]| {
+        let mut rhs_variant =
+            rand::gen_range(0, std::mem::variant_count::<InternalNeuron>()) as u32;
+        let mut internal = InternalNeuron::new_from_u32(rhs_variant);
+        while !is_unique_edge(
+            &NeuralCon::new(Association::new(assoc), lhs, Neuron::Internal(internal)).unwrap(),
+            edges,
+        ) {
+            rhs_variant = rand::gen_range(0, std::mem::variant_count::<InternalNeuron>()) as u32;
+            internal = InternalNeuron::new_from_u32(rhs_variant);
+        }
+        Neuron::Internal(internal)
+    };
+
+    let unique_action = |assoc: f32, lhs: Neuron, edges: &[NeuralCon]| {
+        let mut rhs_variant = rand::gen_range(0, std::mem::variant_count::<ActionNeuron>()) as u32;
+        let mut action = ActionNeuron::new_from_u32(rhs_variant);
+        while !is_unique_edge(
+            &NeuralCon::new(Association::new(assoc), lhs, Neuron::Action(action)).unwrap(),
+            edges,
+        ) {
+            rhs_variant = rand::gen_range(0, std::mem::variant_count::<ActionNeuron>()) as u32;
+            action = ActionNeuron::new_from_u32(rhs_variant);
+        }
+        Neuron::Action(action)
+    };
+
+    let mut edges = Vec::with_capacity(num_edges);
+
+    let mut needs_conn_action = None;
+    let mut needs_conn_sense = None;
+    let mut num_internal = 0;
+    loop {
+        assert!(num_internal <= max_internal_neurons);
+
+        if edges.len() >= num_edges {
+            break;
+        }
+
+        let assoc = rand::gen_range(-4.0, 4.0);
+
+        if edges.len() == num_edges - 1 && needs_conn_sense.is_some() && needs_conn_action.is_some()
+        {
+            edges.pop();
+            needs_conn_sense = None;
+            needs_conn_action = None;
+        }
+
+        if let Some(neuron) = needs_conn_action {
+            match neuron {
+                Neuron::Internal(_) => {
+                    edges.push(
+                        NeuralCon::new(
+                            Association::new(assoc),
+                            neuron,
+                            unique_action(assoc, neuron, &edges),
+                        )
+                        .unwrap(),
+                    );
+                    needs_conn_action = None;
+                    continue;
+                }
+                _ => unreachable!(),
+            }
+        }
+        if let Some(neuron) = needs_conn_sense {
+            match neuron {
+                Neuron::Internal(_) => {
+                    edges.push(
+                        NeuralCon::new(
+                            Association::new(assoc),
+                            unique_sense(assoc, neuron, &edges),
+                            neuron,
+                        )
+                        .unwrap(),
+                    );
+                    needs_conn_sense = None;
+                    continue;
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let lhs_variant = rand::gen_range(0, u32::MAX);
+        let lhs = if num_internal < max_internal_neurons {
+            match rand::gen_range(0, 2) {
+                0 => Neuron::Sense(SenseNeuron::new_from_u32(lhs_variant)),
+                1 => {
+                    num_internal += 1;
+                    Neuron::Internal(InternalNeuron::new_from_u32(lhs_variant))
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            Neuron::Sense(SenseNeuron::new_from_u32(lhs_variant))
+        };
+
+        let rhs = if num_internal < max_internal_neurons {
+            match lhs {
+                Neuron::Sense(_) => match rand::gen_range(0, 2) {
+                    0 => {
+                        let internal = unique_internal(assoc, lhs, &edges);
+                        needs_conn_action = Some(internal);
+                        internal
+                    }
+                    1 => unique_action(assoc, lhs, &edges),
+                    _ => unreachable!(),
+                },
+                Neuron::Internal(_) => match rand::gen_range(0, 2) {
+                    0 => {
+                        let internal = unique_internal(assoc, lhs, &edges);
+                        needs_conn_sense = Some(internal);
+                        needs_conn_action = Some(internal);
+                        internal
+                    }
+                    1 => {
+                        needs_conn_sense = Some(lhs);
+                        unique_action(assoc, lhs, &edges)
+                    }
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            }
+        } else {
+            let internal = unique_internal(assoc, lhs, &edges);
+            needs_conn_action = Some(internal);
+            internal
+        };
+
+        edges.push(NeuralCon::new(Association::new(assoc), lhs, rhs).unwrap());
+    }
+
+    edges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,15 +526,15 @@ mod tests {
             neural_con!(sense, internal),
             neural_con!(internal, internal),
         ])
-        .is_none());
+        .is_some());
         assert!(BrainBuilder::new_with_edges(vec![
             neural_con!(sense, action),
             neural_con!(sense, action),
         ])
         .is_none());
-        assert!(BrainBuilder::new_with_edges(vec![neural_con!(internal, internal)]).is_none());
-        assert!(BrainBuilder::new_with_edges(vec![neural_con!(sense, internal)]).is_none());
-        assert!(BrainBuilder::new_with_edges(vec![neural_con!(internal, action)]).is_none());
+        assert!(BrainBuilder::new_with_edges(vec![neural_con!(internal, internal)]).is_some());
+        assert!(BrainBuilder::new_with_edges(vec![neural_con!(sense, internal)]).is_some());
+        assert!(BrainBuilder::new_with_edges(vec![neural_con!(internal, action)]).is_some());
         assert!(BrainBuilder::new_with_edges(vec![
             neural_con!(
                 Neuron::Internal(InternalNeuron::I3),
@@ -513,5 +647,14 @@ mod tests {
             }
             .fire(&h, &s)
         );
+    }
+
+    #[test]
+    fn test_default_init_brain() {
+        rand::srand(macroquad::miniquad::date::now() as _);
+
+        for _ in 0..1000 {
+            let _ = default_init_edges(4);
+        }
     }
 }
